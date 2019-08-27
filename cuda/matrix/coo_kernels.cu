@@ -155,22 +155,58 @@ __device__ void spmm_kernel(const size_type nnz, const size_type num_lines,
         (static_cast<size_type>(blockDim.y) * blockIdx.x + threadIdx.y) *
         num_lines;
     const auto column_id = start_col + threadIdx.x;
+    const auto tidx = threadIdx.x;
     auto coo_end = coo_idx + num_lines;
     coo_end = (coo_end > nnz) ? nnz : coo_end;
+    const auto tile_block =
+        group::tiled_partition<32>(group::this_thread_block());
     if (column_id < end_col && coo_idx < nnz) {
-        auto curr_row = row[coo_idx];
+        IndexType curr_row;
+        IndexType next_row;
+        ValueType coo_val;
+        IndexType coo_col;
+        const auto num_col = end_col - start_col;
+        curr_row = row[coo_idx + tidx];
         for (auto idx = coo_idx; idx < coo_end - 1; idx++) {
-            temp += val[idx] * b[col[idx] * b_stride + column_id];
-            const auto next_row = row[idx + 1];
-            if (next_row != curr_row) {
-                atomic_add(&(c[curr_row * c_stride + column_id]), scale(temp));
+            const auto mod = (idx - coo_idx) % num_col;
+            if (mod == 0 && (idx + tidx) < coo_end) {
+                coo_val = val[idx + tidx];
+                coo_col = col[idx + tidx];
+            }
+            temp += tile_block.shfl(coo_val, mod) *
+                    b[tile_block.shfl(coo_col, mod) * b_stride + column_id];
+            if (mod == num_col - 1) {
+                if ((idx + tidx + 1) < coo_end) {
+                    next_row = row[idx + 1 + tidx];
+                }
+                if (tile_block.shfl(next_row, 0) !=
+                    tile_block.shfl(curr_row, num_col - 1)) {
+                    atomic_add(&(c[tile_block.shfl(curr_row, mod) * c_stride +
+                                   column_id]),
+                               scale(temp));
+                    temp = zero<ValueType>();
+                }
                 curr_row = next_row;
-                temp = zero<ValueType>();
+            } else {
+                if (tile_block.shfl(curr_row, mod) !=
+                    tile_block.shfl(curr_row, mod + 1)) {
+                    atomic_add(&(c[tile_block.shfl(curr_row, mod) * c_stride +
+                                   column_id]),
+                               scale(temp));
+                    temp = zero<ValueType>();
+                }
             }
         }
-        auto idx = coo_end - 1;
-        temp += val[idx] * b[col[idx] * b_stride + column_id];
-        atomic_add(&(c[row[idx] * c_stride + column_id]), scale(temp));
+        const auto idx = coo_end - 1;
+        const auto mod = (idx - coo_idx) % num_col;
+        if (mod == 0 && (idx + tidx) < coo_end) {
+            coo_val = val[idx + tidx];
+            coo_col = col[idx + tidx];
+        }
+        temp += tile_block.shfl(coo_val, mod) *
+                b[tile_block.shfl(coo_col, mod) * b_stride + column_id];
+        atomic_add(&(c[tile_block.shfl(curr_row, mod) * c_stride + column_id]),
+                   scale(temp));
     }
 }
 
@@ -183,8 +219,8 @@ __global__ __launch_bounds__(spmv_block_size) void abstract_spmm(
     const ValueType *__restrict__ b, const size_type b_stride,
     ValueType *__restrict__ c, const size_type c_stride)
 {
-    for (size_type i = 0; i < num_cols; i += 16) {
-        spmm_kernel(nnz, num_lines, val, col, row, i, min(i + 16, num_cols), b,
+    for (size_type i = 0; i < num_cols; i += 32) {
+        spmm_kernel(nnz, num_lines, val, col, row, i, min(i + 32, num_cols), b,
                     b_stride, c, c_stride,
                     [](const ValueType &x) { return x; });
     }
@@ -286,8 +322,8 @@ void spmv2(std::shared_ptr<const CudaExecutor> exec,
                 as_cuda_type(b->get_const_values()), b->get_stride(),
                 as_cuda_type(c->get_values()), c->get_stride());
         } else {
-            int num_lines = ceildiv(nnz, nwarps * warps_in_block * 2);
-            const dim3 coo_block(16, warps_in_block * 2, 1);
+            int num_lines = ceildiv(nnz, nwarps * warps_in_block);
+            const dim3 coo_block(32, warps_in_block, 1);
             const dim3 coo_grid(nwarps);
             abstract_spmm<<<coo_grid, coo_block>>>(
                 nnz, num_lines, as_cuda_type(a->get_const_values()),
