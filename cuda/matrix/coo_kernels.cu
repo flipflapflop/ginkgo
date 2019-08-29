@@ -139,6 +139,53 @@ __device__ void spmv_kernel(const size_type nnz, const size_type num_lines,
     }
 }
 
+template <bool force, typename Group, typename ValueType, typename IndexType,
+          typename Closure>
+__device__ void warp_spmm(
+    const Group tile_block, const size_type nnz,
+    const ValueType *__restrict__ val, const IndexType *__restrict__ col,
+    const IndexType *__restrict__ row, const ValueType *__restrict__ b,
+    const size_type b_stride, ValueType *__restrict__ c,
+    const size_type c_stride, IndexType *__restrict__ curr_row,
+    ValueType *__restrict__ temp, const size_type offset,
+    const size_type column_id, const size_type end_col, Closure scale)
+{
+    const auto tidx = threadIdx.x;
+    auto coo_val =
+        (offset + tidx < nnz) ? val[offset + tidx] : zero<ValueType>();
+    const auto col_id = (column_id < end_col) ? column_id : end_col - 1;
+    auto coo_col = (offset + tidx < nnz) ? col[offset + tidx] : col[nnz - 1];
+    const int end = min(static_cast<int>(nnz - offset), 32);
+
+    for (int j = 0; j < end - 1; j++) {
+        *temp += tile_block.shfl(coo_val, j) *
+                 b[tile_block.shfl(coo_col, j) * b_stride + col_id];
+        if (tile_block.shfl(*curr_row, j) !=
+            tile_block.shfl(*curr_row, j + 1)) {
+            atomic_add(&(c[tile_block.shfl(*curr_row, j) * c_stride + col_id]),
+                       scale(*temp));
+            *temp = zero<ValueType>();
+        }
+    }
+    *temp += tile_block.shfl(coo_val, end - 1) *
+             b[tile_block.shfl(coo_col, end - 1) * b_stride + col_id];
+
+    if (force) {
+        atomic_add(
+            &(c[tile_block.shfl(*curr_row, end - 1) * c_stride + col_id]),
+            scale(*temp));
+    } else {
+        const auto next_row =
+            (offset + 32 + tidx < nnz) ? row[offset + 32 + tidx] : row[nnz - 1];
+        if (tile_block.shfl(next_row, 0) !=
+            tile_block.shfl(*curr_row, end - 1)) {
+            atomic_add(
+                &(c[tile_block.shfl(*curr_row, end - 1) * c_stride + col_id]),
+                scale(*temp));
+        }
+        *curr_row = next_row;
+    }
+}
 
 template <typename ValueType, typename IndexType, typename Closure>
 __device__ void spmm_kernel(const size_type nnz, const size_type num_lines,
@@ -153,62 +200,98 @@ __device__ void spmm_kernel(const size_type nnz, const size_type num_lines,
     ValueType temp = zero<ValueType>();
     const auto coo_idx =
         (static_cast<size_type>(blockDim.y) * blockIdx.x + threadIdx.y) *
-        num_lines;
-    const auto column_id = start_col + threadIdx.x;
+        num_lines * 32;
     const auto tidx = threadIdx.x;
-    auto coo_end = coo_idx + num_lines;
-    coo_end = (coo_end > nnz) ? nnz : coo_end;
-    const auto tile_block =
-        group::tiled_partition<32>(group::this_thread_block());
-    if (column_id < end_col && coo_idx < nnz) {
-        IndexType curr_row;
-        IndexType next_row;
-        ValueType coo_val;
-        IndexType coo_col;
-        const auto num_col = end_col - start_col;
-        curr_row = row[coo_idx + tidx];
-        for (auto idx = coo_idx; idx < coo_end - 1; idx++) {
-            const auto mod = (idx - coo_idx) % num_col;
-            if (mod == 0 && (idx + tidx) < coo_end) {
-                coo_val = val[idx + tidx];
-                coo_col = col[idx + tidx];
-            }
-            temp += tile_block.shfl(coo_val, mod) *
-                    b[tile_block.shfl(coo_col, mod) * b_stride + column_id];
-            if (mod == num_col - 1) {
-                if ((idx + tidx + 1) < coo_end) {
-                    next_row = row[idx + 1 + tidx];
-                }
-                if (tile_block.shfl(next_row, 0) !=
-                    tile_block.shfl(curr_row, num_col - 1)) {
-                    atomic_add(&(c[tile_block.shfl(curr_row, mod) * c_stride +
-                                   column_id]),
-                               scale(temp));
-                    temp = zero<ValueType>();
-                }
-                curr_row = next_row;
-            } else {
-                if (tile_block.shfl(curr_row, mod) !=
-                    tile_block.shfl(curr_row, mod + 1)) {
-                    atomic_add(&(c[tile_block.shfl(curr_row, mod) * c_stride +
-                                   column_id]),
-                               scale(temp));
-                    temp = zero<ValueType>();
-                }
-            }
+    const auto column_id = start_col + tidx;
+    if (coo_idx < nnz) {
+        const int lines = min(static_cast<int>(ceildiv(nnz - coo_idx, 32)),
+                              static_cast<int>(num_lines));
+        const auto tile_block =
+            group::tiled_partition<32>(group::this_thread_block());
+        auto curr_row = row[coo_idx + tidx];
+        for (int i = 0; i < lines - 1; i++) {
+            warp_spmm<false>(tile_block, nnz, val, col, row, b, b_stride, c,
+                             c_stride, &curr_row, &temp, coo_idx + i * 32,
+                             column_id, end_col, scale);
         }
-        const auto idx = coo_end - 1;
-        const auto mod = (idx - coo_idx) % num_col;
-        if (mod == 0 && (idx + tidx) < coo_end) {
-            coo_val = val[idx + tidx];
-            coo_col = col[idx + tidx];
-        }
-        temp += tile_block.shfl(coo_val, mod) *
-                b[tile_block.shfl(coo_col, mod) * b_stride + column_id];
-        atomic_add(&(c[tile_block.shfl(curr_row, mod) * c_stride + column_id]),
-                   scale(temp));
+        warp_spmm<true>(tile_block, nnz, val, col, row, b, b_stride, c,
+                        c_stride, &curr_row, &temp, coo_idx + (lines - 1) * 32,
+                        column_id, end_col, scale);
     }
 }
+
+// template <typename ValueType, typename IndexType, typename Closure>
+// __device__ void spmm_kernel(const size_type nnz, const size_type num_lines,
+//                             const ValueType *__restrict__ val,
+//                             const IndexType *__restrict__ col,
+//                             const IndexType *__restrict__ row,
+//                             const size_type start_col, const size_type
+//                             end_col, const ValueType *__restrict__ b, const
+//                             size_type b_stride, ValueType *__restrict__ c,
+//                             const size_type c_stride, Closure scale)
+// {
+//     ValueType temp = zero<ValueType>();
+//     const auto coo_idx =
+//         (static_cast<size_type>(blockDim.y) * blockIdx.x + threadIdx.y) *
+//         num_lines;
+//     const auto column_id = start_col + threadIdx.x;
+//     const auto tidx = threadIdx.x;
+//     auto coo_end = coo_idx + num_lines;
+//     coo_end = (coo_end > nnz) ? nnz : coo_end;
+//     const auto tile_block =
+//         group::tiled_partition<32>(group::this_thread_block());
+//     if (column_id < end_col && coo_idx < nnz) {
+//         IndexType curr_row;
+//         IndexType next_row;
+//         ValueType coo_val;
+//         IndexType coo_col;
+//         const auto num_col = end_col - start_col;
+//         curr_row = row[coo_idx + tidx];
+//         for (auto idx = coo_idx; idx < coo_end - 1; idx++) {
+//             const auto mod = (idx - coo_idx) % num_col;
+//             if (mod == 0 && (idx + tidx) < coo_end) {
+//                 coo_val = val[idx + tidx];
+//                 coo_col = col[idx + tidx];
+//             }
+//             temp += tile_block.shfl(coo_val, mod) *
+//                     b[tile_block.shfl(coo_col, mod) * b_stride + column_id];
+//             if (mod == num_col - 1) {
+//                 if ((idx + tidx + 1) < coo_end) {
+//                     next_row = row[idx + 1 + tidx];
+//                 }
+//                 if (tile_block.shfl(next_row, 0) !=
+//                     tile_block.shfl(curr_row, num_col - 1)) {
+//                     atomic_add(&(c[tile_block.shfl(curr_row, mod) * c_stride
+//                     +
+//                                    column_id]),
+//                                scale(temp));
+//                     temp = zero<ValueType>();
+//                 }
+//                 curr_row = next_row;
+//             } else {
+//                 if (tile_block.shfl(curr_row, mod) !=
+//                     tile_block.shfl(curr_row, mod + 1)) {
+//                     atomic_add(&(c[tile_block.shfl(curr_row, mod) * c_stride
+//                     +
+//                                    column_id]),
+//                                scale(temp));
+//                     temp = zero<ValueType>();
+//                 }
+//             }
+//         }
+//         const auto idx = coo_end - 1;
+//         const auto mod = (idx - coo_idx) % num_col;
+//         if (mod == 0 && (idx + tidx) < coo_end) {
+//             coo_val = val[idx + tidx];
+//             coo_col = col[idx + tidx];
+//         }
+//         temp += tile_block.shfl(coo_val, mod) *
+//                 b[tile_block.shfl(coo_col, mod) * b_stride + column_id];
+//         atomic_add(&(c[tile_block.shfl(curr_row, mod) * c_stride +
+//         column_id]),
+//                    scale(temp));
+//     }
+// }
 
 
 template <typename ValueType, typename IndexType>
@@ -322,9 +405,9 @@ void spmv2(std::shared_ptr<const CudaExecutor> exec,
                 as_cuda_type(b->get_const_values()), b->get_stride(),
                 as_cuda_type(c->get_values()), c->get_stride());
         } else {
-            int num_lines = ceildiv(nnz, nwarps * warps_in_block);
+            int num_lines = ceildiv(nnz, nwarps * cuda_config::warp_size);
             const dim3 coo_block(32, warps_in_block, 1);
-            const dim3 coo_grid(nwarps);
+            const dim3 coo_grid(ceildiv(nwarps, warps_in_block));
             abstract_spmm<<<coo_grid, coo_block>>>(
                 nnz, num_lines, as_cuda_type(a->get_const_values()),
                 a->get_const_col_idxs(), as_cuda_type(a->get_const_row_idxs()),
