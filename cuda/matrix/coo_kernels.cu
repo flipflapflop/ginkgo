@@ -156,14 +156,15 @@ __device__ void warp_spmm(
     const auto col_id = (column_id < end_col) ? column_id : end_col - 1;
     auto coo_col = (offset + tidx < nnz) ? col[offset + tidx] : col[nnz - 1];
     const int end = min(static_cast<int>(nnz - offset), 32);
-
     for (int j = 0; j < end - 1; j++) {
         *temp += tile_block.shfl(coo_val, j) *
                  b[tile_block.shfl(coo_col, j) * b_stride + col_id];
         if (tile_block.shfl(*curr_row, j) !=
             tile_block.shfl(*curr_row, j + 1)) {
-            atomic_add(&(c[tile_block.shfl(*curr_row, j) * c_stride + col_id]),
-                       scale(*temp));
+            const auto temp_row = tile_block.shfl(*curr_row, j);
+            if (column_id < end_col) {
+                atomic_add(&(c[temp_row * c_stride + col_id]), scale(*temp));
+            }
             *temp = zero<ValueType>();
         }
     }
@@ -171,17 +172,20 @@ __device__ void warp_spmm(
              b[tile_block.shfl(coo_col, end - 1) * b_stride + col_id];
 
     if (force) {
-        atomic_add(
-            &(c[tile_block.shfl(*curr_row, end - 1) * c_stride + col_id]),
-            scale(*temp));
+        const auto temp_row = tile_block.shfl(*curr_row, end - 1);
+        if (column_id < end_col) {
+            atomic_add(&(c[temp_row * c_stride + col_id]), scale(*temp));
+        }
     } else {
         const auto next_row =
             (offset + 32 + tidx < nnz) ? row[offset + 32 + tidx] : row[nnz - 1];
         if (tile_block.shfl(next_row, 0) !=
             tile_block.shfl(*curr_row, end - 1)) {
-            atomic_add(
-                &(c[tile_block.shfl(*curr_row, end - 1) * c_stride + col_id]),
-                scale(*temp));
+            const auto temp_row = tile_block.shfl(*curr_row, end - 1);
+            if (column_id < end_col) {
+                atomic_add(&(c[temp_row * c_stride + col_id]), scale(*temp));
+            }
+            *temp = zero<ValueType>();
         }
         *curr_row = next_row;
     }
@@ -208,7 +212,8 @@ __device__ void spmm_kernel(const size_type nnz, const size_type num_lines,
                               static_cast<int>(num_lines));
         const auto tile_block =
             group::tiled_partition<32>(group::this_thread_block());
-        auto curr_row = row[coo_idx + tidx];
+        auto curr_row =
+            (coo_idx + tidx < nnz) ? row[coo_idx + tidx] : row[nnz - 1];
         for (int i = 0; i < lines - 1; i++) {
             warp_spmm<false>(tile_block, nnz, val, col, row, b, b_stride, c,
                              c_stride, &curr_row, &temp, coo_idx + i * 32,
