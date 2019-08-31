@@ -883,6 +883,7 @@ public:
         return cusparse_handle_.get();
     }
 
+
 protected:
     void set_gpu_property();
 

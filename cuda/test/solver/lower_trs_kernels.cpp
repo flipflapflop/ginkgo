@@ -40,6 +40,9 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <random>
 
 
+#include <cuda.h>
+
+
 #include <ginkgo/core/base/exception.hpp>
 #include <ginkgo/core/base/executor.hpp>
 #include <ginkgo/core/matrix/csr.hpp>
@@ -95,6 +98,22 @@ protected:
     std::ranlux48 rand_engine;
 };
 
+
+TEST_F(LowerTrs, CudaLowerTrsFlagCheckIsCorrect)
+{
+    bool trans_flag = true;
+    bool expected_flag = false;
+#if (defined(CUDA_VERSION) && (CUDA_VERSION >= 9020))
+    expected_flag = false;
+#elif (defined(CUDA_VERSION) && (CUDA_VERSION < 9020))
+    expected_flag = true;
+#endif
+    gko::kernels::cuda::lower_trs::perform_transpose(cuda, trans_flag);
+
+    ASSERT_EQ(expected_flag, trans_flag);
+}
+
+
 TEST_F(LowerTrs, CudaSingleRhsApplyIsEquivalentToRef)
 {
     std::shared_ptr<Mtx> mtx = gen_l_mtx(50, 50);
@@ -119,6 +138,7 @@ TEST_F(LowerTrs, CudaSingleRhsApplyIsEquivalentToRef)
     d_solver->apply(d_b2.get(), d_x.get());
     GKO_ASSERT_MTX_NEAR(d_x, x, 1e-14);
 }
+
 
 TEST_F(LowerTrs, CudaMultipleRhsApplyIsEquivalentToRef)
 {
