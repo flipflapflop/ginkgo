@@ -48,6 +48,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include "cuda/components/cooperative_groups.cuh"
 #include "cuda/components/format_conversion.cuh"
 #include "cuda/components/segment_scan.cuh"
+#include "cuda/components/zero_array.hpp"
 
 
 namespace gko {
@@ -139,215 +140,6 @@ __device__ void spmv_kernel(const size_type nnz, const size_type num_lines,
     }
 }
 
-template <bool force, bool final, typename Group, typename ValueType,
-          typename IndexType, typename Closure>
-__device__ void warp_spmm(
-    const Group tile_block, const size_type nnz,
-    const ValueType *__restrict__ val, const IndexType *__restrict__ col,
-    const IndexType *__restrict__ row, const ValueType *__restrict__ b,
-    const size_type b_stride, ValueType *__restrict__ c,
-    const size_type c_stride, IndexType *__restrict__ curr_row,
-    ValueType *__restrict__ temp, const size_type offset,
-    const size_type column_id, const size_type end_col, Closure scale)
-{
-    const bool is_work = column_id < end_col;
-    const auto coo_val =
-        (!final || offset < nnz) ? val[offset] : zero<ValueType>();
-    const auto col_id = (is_work) ? column_id : end_col - 1;
-    const auto coo_col = (!final || offset < nnz) ? col[offset] : col[nnz - 1];
-    int j = 0;
-    auto temp_row = tile_block.shfl(*curr_row, 0);
-
-    if (!final) {
-        constexpr int end = 32;
-#pragma unroll
-        for (; j < end - 1; j++) {
-            const auto temp_next_row = tile_block.shfl(*curr_row, j + 1);
-            *temp += tile_block.shfl(coo_val, j) *
-                     b[tile_block.shfl(coo_col, j) * b_stride + col_id];
-            if (temp_row != temp_next_row) {
-                if (is_work) {
-                    atomic_add(&(c[temp_row * c_stride + col_id]),
-                               scale(*temp));
-                }
-                *temp = zero<ValueType>();
-                temp_row = temp_next_row;
-            }
-        }
-    } else {
-        const int end = min(static_cast<int>(nnz - (offset - threadIdx.x)), 32);
-#pragma unroll
-        for (; j < end - 1; j++) {
-            const auto temp_next_row = tile_block.shfl(*curr_row, j + 1);
-            *temp += tile_block.shfl(coo_val, j) *
-                     b[tile_block.shfl(coo_col, j) * b_stride + col_id];
-
-            if (temp_row != temp_next_row) {
-                if (is_work) {
-                    atomic_add(&(c[temp_row * c_stride + col_id]),
-                               scale(*temp));
-                }
-                *temp = zero<ValueType>();
-                temp_row = temp_next_row;
-            }
-        }
-    }
-
-    *temp += tile_block.shfl(coo_val, j) *
-             b[tile_block.shfl(coo_col, j) * b_stride + col_id];
-    if (force) {
-        if (is_work) {
-            atomic_add(&(c[temp_row * c_stride + col_id]), scale(*temp));
-        }
-    } else {
-        const auto next_row =
-            (!final || offset + 32 < nnz) ? row[offset + 32] : row[nnz - 1];
-        if (tile_block.shfl(next_row, 0) != temp_row) {
-            if (is_work) {
-                atomic_add(&(c[temp_row * c_stride + col_id]), scale(*temp));
-            }
-            *temp = zero<ValueType>();
-        }
-        *curr_row = next_row;
-    }
-}
-
-template <typename ValueType, typename IndexType, typename Closure>
-__device__ void spmm_kernel(const size_type nnz, const size_type num_lines,
-                            const ValueType *__restrict__ val,
-                            const IndexType *__restrict__ col,
-                            const IndexType *__restrict__ row,
-                            const size_type end_col,
-                            const ValueType *__restrict__ b,
-                            const size_type b_stride, ValueType *__restrict__ c,
-                            const size_type c_stride, Closure scale)
-{
-    ValueType temp = zero<ValueType>();
-    const auto tidx = threadIdx.x;
-    const auto coo_idx =
-        (static_cast<size_type>(blockDim.y) * blockIdx.x + threadIdx.y) *
-            num_lines * 32 +
-        tidx;
-    const auto tile_block =
-        group::tiled_partition<32>(group::this_thread_block());
-    const auto column_id = blockIdx.y * 32 + tidx;
-    if (blockIdx.x == gridDim.x - 1) {
-        if (coo_idx - tidx < nnz) {
-            const int lines =
-                min(static_cast<int>(ceildiv(nnz - (coo_idx - tidx), 32)),
-                    static_cast<int>(num_lines));
-            auto curr_row = (coo_idx < nnz) ? row[coo_idx] : row[nnz - 1];
-            for (int i = 0; i < lines - 1; i++) {
-                warp_spmm<false, true>(tile_block, nnz, val, col, row, b,
-                                       b_stride, c, c_stride, &curr_row, &temp,
-                                       coo_idx + i * 32, column_id, end_col,
-                                       scale);
-            }
-            warp_spmm<true, true>(tile_block, nnz, val, col, row, b, b_stride,
-                                  c, c_stride, &curr_row, &temp,
-                                  coo_idx + (lines - 1) * 32, column_id,
-                                  end_col, scale);
-        }
-    } else {
-        auto curr_row = row[coo_idx];
-        for (int i = 0; i < num_lines - 1; i++) {
-            warp_spmm<false, false>(
-                tile_block, nnz, val, col, row, b, b_stride, c, c_stride,
-                &curr_row, &temp, coo_idx + i * 32, column_id, end_col, scale);
-        }
-        warp_spmm<true, false>(
-            tile_block, nnz, val, col, row, b, b_stride, c, c_stride, &curr_row,
-            &temp, coo_idx + (num_lines - 1) * 32, column_id, end_col, scale);
-    }
-}
-
-
-// template <typename ValueType, typename IndexType, typename Closure>
-// __device__ void spmm_kernel(const size_type nnz, const size_type num_lines,
-//                             const ValueType *__restrict__ val,
-//                             const IndexType *__restrict__ col,
-//                             const IndexType *__restrict__ row,
-//                             const size_type start_col, const size_type
-//                             end_col, const ValueType *__restrict__ b, const
-//                             size_type b_stride, ValueType *__restrict__ c,
-//                             const size_type c_stride, Closure scale)
-// {
-//     ValueType temp = zero<ValueType>();
-//     const auto coo_idx =
-//         (static_cast<size_type>(blockDim.y) * blockIdx.x + threadIdx.y) *
-//         num_lines;
-//     const auto column_id = start_col + threadIdx.x;
-//     const auto tidx = threadIdx.x;
-//     auto coo_end = coo_idx + num_lines;
-//     coo_end = (coo_end > nnz) ? nnz : coo_end;
-//     const auto tile_block =
-//         group::tiled_partition<32>(group::this_thread_block());
-//     if (column_id < end_col && coo_idx < nnz) {
-//         IndexType curr_row;
-//         IndexType next_row;
-//         ValueType coo_val;
-//         IndexType coo_col;
-//         const auto num_col = end_col - start_col;
-//         curr_row = row[coo_idx + tidx];
-//         for (auto idx = coo_idx; idx < coo_end - 1; idx++) {
-//             const auto mod = (idx - coo_idx) % num_col;
-//             if (mod == 0 && (idx + tidx) < coo_end) {
-//                 coo_val = val[idx + tidx];
-//                 coo_col = col[idx + tidx];
-//             }
-//             temp += tile_block.shfl(coo_val, mod) *
-//                     b[tile_block.shfl(coo_col, mod) * b_stride + column_id];
-//             if (mod == num_col - 1) {
-//                 if ((idx + tidx + 1) < coo_end) {
-//                     next_row = row[idx + 1 + tidx];
-//                 }
-//                 if (tile_block.shfl(next_row, 0) !=
-//                     tile_block.shfl(curr_row, num_col - 1)) {
-//                     atomic_add(&(c[tile_block.shfl(curr_row, mod) * c_stride
-//                     +
-//                                    column_id]),
-//                                scale(temp));
-//                     temp = zero<ValueType>();
-//                 }
-//                 curr_row = next_row;
-//             } else {
-//                 if (tile_block.shfl(curr_row, mod) !=
-//                     tile_block.shfl(curr_row, mod + 1)) {
-//                     atomic_add(&(c[tile_block.shfl(curr_row, mod) * c_stride
-//                     +
-//                                    column_id]),
-//                                scale(temp));
-//                     temp = zero<ValueType>();
-//                 }
-//             }
-//         }
-//         const auto idx = coo_end - 1;
-//         const auto mod = (idx - coo_idx) % num_col;
-//         if (mod == 0 && (idx + tidx) < coo_end) {
-//             coo_val = val[idx + tidx];
-//             coo_col = col[idx + tidx];
-//         }
-//         temp += tile_block.shfl(coo_val, mod) *
-//                 b[tile_block.shfl(coo_col, mod) * b_stride + column_id];
-//         atomic_add(&(c[tile_block.shfl(curr_row, mod) * c_stride +
-//         column_id]),
-//                    scale(temp));
-//     }
-// }
-
-
-template <typename ValueType, typename IndexType>
-__global__ __launch_bounds__(spmv_block_size) void abstract_spmm(
-    const size_type nnz, const size_type num_lines,
-    const ValueType *__restrict__ val, const IndexType *__restrict__ col,
-    const IndexType *__restrict__ row, const size_type num_cols,
-    const ValueType *__restrict__ b, const size_type b_stride,
-    ValueType *__restrict__ c, const size_type c_stride)
-{
-    spmm_kernel(nnz, num_lines, val, col, row, num_cols, b, b_stride, c,
-                c_stride, [](const ValueType &x) { return x; });
-}
-
 
 template <typename ValueType, typename IndexType>
 __global__ __launch_bounds__(spmv_block_size) void abstract_spmv(
@@ -377,15 +169,162 @@ __global__ __launch_bounds__(spmv_block_size) void abstract_spmv(
 }
 
 
-template <typename ValueType>
-__global__ __launch_bounds__(default_block_size) void set_zero(
-    const size_type nnz, ValueType *__restrict__ val)
+template <bool force, bool final, int subwarp_size = cuda_config::warp_size,
+          typename Group, typename ValueType, typename IndexType,
+          typename Closure>
+__device__ void warp_spmm(
+    const Group tile_block, const size_type nnz,
+    const ValueType *__restrict__ val, const IndexType *__restrict__ col,
+    const IndexType *__restrict__ row, const ValueType *__restrict__ b,
+    const size_type b_stride, ValueType *__restrict__ c,
+    const size_type c_stride, IndexType *__restrict__ curr_row,
+    ValueType *__restrict__ temp, const size_type offset,
+    const size_type column_id, const size_type end_col, Closure scale)
 {
-    const auto ind =
-        static_cast<size_type>(blockDim.x) * blockIdx.x + threadIdx.x;
-    if (ind < nnz) {
-        val[ind] = zero<ValueType>();
+    const auto coo_val =
+        (!final || offset < nnz) ? val[offset] : zero<ValueType>();
+    const auto col_id = (column_id < end_col) ? column_id : end_col - 1;
+    const auto coo_col = (!final || offset < nnz) ? col[offset] : col[nnz - 1];
+    int j = 0;
+    auto temp_row = tile_block.shfl(*curr_row, 0);
+
+    if (!final) {
+        constexpr int end = subwarp_size;
+#pragma unroll
+        for (; j < end - 1; j++) {
+            const auto temp_next_row = tile_block.shfl(*curr_row, j + 1);
+            *temp += tile_block.shfl(coo_val, j) *
+                     b[tile_block.shfl(coo_col, j) * b_stride + col_id];
+            if (temp_row != temp_next_row) {
+                if (column_id < end_col) {
+                    atomic_add(&(c[temp_row * c_stride + col_id]),
+                               scale(*temp));
+                }
+                *temp = zero<ValueType>();
+                temp_row = temp_next_row;
+            }
+        }
+    } else {
+        const int end =
+            min(static_cast<int>(nnz - (offset - threadIdx.x)), subwarp_size);
+#pragma unroll
+        for (; j < end - 1; j++) {
+            const auto temp_next_row = tile_block.shfl(*curr_row, j + 1);
+            *temp += tile_block.shfl(coo_val, j) *
+                     b[tile_block.shfl(coo_col, j) * b_stride + col_id];
+
+            if (temp_row != temp_next_row) {
+                if (column_id < end_col) {
+                    atomic_add(&(c[temp_row * c_stride + col_id]),
+                               scale(*temp));
+                }
+                *temp = zero<ValueType>();
+                temp_row = temp_next_row;
+            }
+        }
     }
+
+    *temp += tile_block.shfl(coo_val, j) *
+             b[tile_block.shfl(coo_col, j) * b_stride + col_id];
+    if (force) {
+        if (column_id < end_col) {
+            atomic_add(&(c[temp_row * c_stride + col_id]), scale(*temp));
+        }
+    } else {
+        const auto next_row = (!final || offset + subwarp_size < nnz)
+                                  ? row[offset + subwarp_size]
+                                  : row[nnz - 1];
+        if (tile_block.shfl(next_row, 0) != temp_row) {
+            if (column_id < end_col) {
+                atomic_add(&(c[temp_row * c_stride + col_id]), scale(*temp));
+            }
+            *temp = zero<ValueType>();
+        }
+        *curr_row = next_row;
+    }
+}
+
+template <int subwarp_size = cuda_config::warp_size, typename ValueType,
+          typename IndexType, typename Closure>
+__device__ void spmm_kernel(const size_type nnz, const size_type num_lines,
+                            const ValueType *__restrict__ val,
+                            const IndexType *__restrict__ col,
+                            const IndexType *__restrict__ row,
+                            const size_type end_col,
+                            const ValueType *__restrict__ b,
+                            const size_type b_stride, ValueType *__restrict__ c,
+                            const size_type c_stride, Closure scale)
+{
+    ValueType temp = zero<ValueType>();
+    const auto tidx = threadIdx.x;
+    auto coo_idx =
+        (static_cast<size_type>(blockDim.y) * blockIdx.x + threadIdx.y) *
+            num_lines * subwarp_size +
+        tidx;
+    const auto tile_block =
+        group::tiled_partition<subwarp_size>(group::this_thread_block());
+    const auto column_id = blockIdx.y * subwarp_size + tidx;
+    if (blockIdx.x == gridDim.x - 1) {
+        // The final block needs to check the index is valid
+        if (coo_idx - tidx < nnz) {
+            const int lines = min(
+                static_cast<int>(ceildiv(nnz - (coo_idx - tidx), subwarp_size)),
+                static_cast<int>(num_lines));
+            const auto coo_end = coo_idx + (lines - 1) * subwarp_size;
+            auto curr_row = (coo_idx < nnz) ? row[coo_idx] : row[nnz - 1];
+            for (; coo_idx < coo_end; coo_idx += subwarp_size) {
+                warp_spmm<false, true, subwarp_size>(
+                    tile_block, nnz, val, col, row, b, b_stride, c, c_stride,
+                    &curr_row, &temp, coo_idx, column_id, end_col, scale);
+            }
+            warp_spmm<true, true, subwarp_size>(
+                tile_block, nnz, val, col, row, b, b_stride, c, c_stride,
+                &curr_row, &temp, coo_end, column_id, end_col, scale);
+        }
+    } else {
+        auto curr_row = row[coo_idx];
+        const auto coo_end = coo_idx + (num_lines - 1) * subwarp_size;
+        for (; coo_idx < coo_end; coo_idx += subwarp_size) {
+            warp_spmm<false, false, subwarp_size>(
+                tile_block, nnz, val, col, row, b, b_stride, c, c_stride,
+                &curr_row, &temp, coo_idx, column_id, end_col, scale);
+        }
+        warp_spmm<true, false, subwarp_size>(
+            tile_block, nnz, val, col, row, b, b_stride, c, c_stride, &curr_row,
+            &temp, coo_end, column_id, end_col, scale);
+    }
+}
+
+
+template <int subwarp_size = cuda_config::warp_size, typename ValueType,
+          typename IndexType>
+__global__ __launch_bounds__(spmv_block_size) void abstract_spmm(
+    const size_type nnz, const size_type num_lines,
+    const ValueType *__restrict__ val, const IndexType *__restrict__ col,
+    const IndexType *__restrict__ row, const size_type num_cols,
+    const ValueType *__restrict__ b, const size_type b_stride,
+    ValueType *__restrict__ c, const size_type c_stride)
+{
+    spmm_kernel<subwarp_size>(nnz, num_lines, val, col, row, num_cols, b,
+                              b_stride, c, c_stride,
+                              [](const ValueType &x) { return x; });
+}
+
+
+template <int subwarp_size = cuda_config::warp_size, typename ValueType,
+          typename IndexType>
+__global__ __launch_bounds__(spmv_block_size) void abstract_spmm(
+    const size_type nnz, const size_type num_lines,
+    const ValueType *__restrict__ alpha, const ValueType *__restrict__ val,
+    const IndexType *__restrict__ col, const IndexType *__restrict__ row,
+    const size_type num_cols, const ValueType *__restrict__ b,
+    const size_type b_stride, ValueType *__restrict__ c,
+    const size_type c_stride)
+{
+    ValueType scale_factor = alpha[0];
+    spmm_kernel<subwarp_size>(
+        nnz, num_lines, val, col, row, num_cols, b, b_stride, c, c_stride,
+        [&scale_factor](const ValueType &x) { return scale_factor * x; });
 }
 
 
@@ -397,10 +336,7 @@ void spmv(std::shared_ptr<const CudaExecutor> exec,
           const matrix::Coo<ValueType, IndexType> *a,
           const matrix::Dense<ValueType> *b, matrix::Dense<ValueType> *c)
 {
-    auto nnz = c->get_num_stored_elements();
-    const dim3 grid(ceildiv(nnz, default_block_size));
-    const dim3 block(default_block_size);
-    set_zero<<<grid, block>>>(nnz, as_cuda_type(c->get_values()));
+    zero_array(c->get_num_stored_elements(), c->get_values());
 
     spmv2(exec, a, b, c);
 }
@@ -436,8 +372,7 @@ void spmv2(std::shared_ptr<const CudaExecutor> exec,
         if (b->get_size()[1] == 1) {
             int num_lines = ceildiv(nnz, nwarps * cuda_config::warp_size);
             const dim3 coo_block(cuda_config::warp_size, warps_in_block, 1);
-            const dim3 coo_grid(ceildiv(nwarps, warps_in_block),
-                                b->get_size()[1]);
+            const dim3 coo_grid(ceildiv(nwarps, warps_in_block));
             abstract_spmv<<<coo_grid, coo_block>>>(
                 nnz, num_lines, as_cuda_type(a->get_const_values()),
                 a->get_const_col_idxs(), as_cuda_type(a->get_const_row_idxs()),
@@ -445,9 +380,11 @@ void spmv2(std::shared_ptr<const CudaExecutor> exec,
                 as_cuda_type(c->get_values()), c->get_stride());
         } else {
             int num_lines = ceildiv(nnz, nwarps * cuda_config::warp_size);
-            const dim3 coo_block(32, warps_in_block, 1);
-            const dim3 coo_grid(ceildiv(
-                nnz, num_lines * cuda_config::warp_size * warps_in_block));
+            const dim3 coo_block(cuda_config::warp_size, warps_in_block, 1);
+            const dim3 coo_grid(
+                ceildiv(nnz,
+                        num_lines * cuda_config::warp_size * warps_in_block),
+                ceildiv(b->get_size()[1], cuda_config::warp_size));
             abstract_spmm<<<coo_grid, coo_block>>>(
                 nnz, num_lines, as_cuda_type(a->get_const_values()),
                 a->get_const_col_idxs(), as_cuda_type(a->get_const_row_idxs()),
@@ -472,15 +409,30 @@ void advanced_spmv2(std::shared_ptr<const CudaExecutor> exec,
 
     auto nwarps = host_kernel::calculate_nwarps(exec, nnz);
     if (nwarps > 0) {
-        int num_lines = ceildiv(nnz, nwarps * cuda_config::warp_size);
-        const dim3 coo_block(cuda_config::warp_size, warps_in_block, 1);
-        const dim3 coo_grid(ceildiv(nwarps, warps_in_block), b->get_size()[1]);
-        abstract_spmv<<<coo_grid, coo_block>>>(
-            nnz, num_lines, as_cuda_type(alpha->get_const_values()),
-            as_cuda_type(a->get_const_values()), a->get_const_col_idxs(),
-            as_cuda_type(a->get_const_row_idxs()),
-            as_cuda_type(b->get_const_values()), b->get_stride(),
-            as_cuda_type(c->get_values()), c->get_stride());
+        if (b->get_size()[1] == 1) {
+            int num_lines = ceildiv(nnz, nwarps * cuda_config::warp_size);
+            const dim3 coo_block(cuda_config::warp_size, warps_in_block, 1);
+            const dim3 coo_grid(ceildiv(nwarps, warps_in_block));
+            abstract_spmv<<<coo_grid, coo_block>>>(
+                nnz, num_lines, as_cuda_type(alpha->get_const_values()),
+                as_cuda_type(a->get_const_values()), a->get_const_col_idxs(),
+                as_cuda_type(a->get_const_row_idxs()),
+                as_cuda_type(b->get_const_values()), b->get_stride(),
+                as_cuda_type(c->get_values()), c->get_stride());
+        } else {
+            int num_lines = ceildiv(nnz, nwarps * cuda_config::warp_size);
+            const dim3 coo_block(cuda_config::warp_size, warps_in_block, 1);
+            const dim3 coo_grid(
+                ceildiv(nnz,
+                        num_lines * cuda_config::warp_size * warps_in_block),
+                ceildiv(b->get_size()[1], cuda_config::warp_size));
+            abstract_spmm<<<coo_grid, coo_block>>>(
+                nnz, num_lines, as_cuda_type(alpha->get_const_values()),
+                as_cuda_type(a->get_const_values()), a->get_const_col_idxs(),
+                as_cuda_type(a->get_const_row_idxs()), b->get_size()[1],
+                as_cuda_type(b->get_const_values()), b->get_stride(),
+                as_cuda_type(c->get_values()), c->get_stride());
+        }
     }
 }
 
