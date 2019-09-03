@@ -19,9 +19,11 @@ stages:
   C_COMPILER: gcc
   CXX_COMPILER: g++
   BUILD_TYPE: Debug
+  BUILD_SHARED_LIBS: "ON"
   BUILD_REFERENCE: "ON"
   BUILD_OMP: "OFF"
   BUILD_CUDA: "OFF"
+  BUILD_HIP: "OFF"
   CXX_FLAGS: ""
   EXTRA_CMAKE_FLAGS: ""
 
@@ -48,9 +50,10 @@ stages:
     - cmake ${CI_PROJECT_DIR}
         -DCMAKE_C_COMPILER=${C_COMPILER} -DCMAKE_CXX_COMPILER=${CXX_COMPILER}
         -DCMAKE_BUILD_TYPE=${BUILD_TYPE} -DCMAKE_CXX_FLAGS="${CXX_FLAGS}"
-        -DCMAKE_CUDA_HOST_COMPILER=$(which ${CXX_COMPILER}) ${EXTRA_CMAKE_FLAGS}
+        -DBUILD_SHARED_LIBS=${BUILD_SHARED_LIBS} ${EXTRA_CMAKE_FLAGS}
         -DGINKGO_DEVEL_TOOLS=OFF -DGINKGO_BUILD_REFERENCE=${BUILD_REFERENCE}
         -DGINKGO_BUILD_OMP=${BUILD_OMP} -DGINKGO_BUILD_CUDA=${BUILD_CUDA}
+        -DGINKGO_BUILD_HIP=${BUILD_HIP}
         -DGINKGO_BUILD_TESTS=ON -DGINKGO_BUILD_EXAMPLES=ON
     - make -j$(grep "core id" /proc/cpuinfo | sort -u | wc -l)
   artifacts:
@@ -59,10 +62,12 @@ stages:
       - "build/*/*/*/*/*/*.cmake"
       - "build/*/*/*/*/*/core/test"
       - "build/*/*/*/*/*/cuda/test"
+      - "build/*/*/*/*/*/hip/test"
       - "build/*/*/*/*/*/omp/test"
       - "build/*/*/*/*/*/reference/test"
       - "build/*/*/*/*/*/core/libginkgo*"
       - "build/*/*/*/*/*/cuda/libginkgo*"
+      - "build/*/*/*/*/*/hip/libginkgo*"
       - "build/*/*/*/*/*/omp/libginkgo*"
       - "build/*/*/*/*/*/reference/libginkgo*"
       - "build/*/*/*/*/*/core/device_hooks/libginkgo*"
@@ -118,8 +123,8 @@ build/cuda90/gcc/all/debug/shared:
     BUILD_OMP: "ON"
     BUILD_CUDA: "ON"
     BUILD_TYPE: Debug
-    EXTRA_CMAKE_FLAGS: &cuda_flags_shared
-      "-DGINKGO_CUDA_ARCHITECTURES=35 -DBUILD_SHARED_LIBS=ON"
+    EXTRA_CMAKE_FLAGS: &cuda_flags
+      "-DGINKGO_CUDA_ARCHITECTURES=35"
 
 build/cuda90/clang/all/release/static:
   <<: *default_build
@@ -131,8 +136,8 @@ build/cuda90/clang/all/release/static:
     BUILD_OMP: "ON"
     BUILD_CUDA: "ON"
     BUILD_TYPE: Release
-    EXTRA_CMAKE_FLAGS: &cuda_flags_static
-      "-DGINKGO_CUDA_ARCHITECTURES=35 -DBUILD_SHARED_LIBS=OFF"
+    BUILD_SHARED_LIBS: "OFF"
+    EXTRA_CMAKE_FLAGS: *cuda_flags
 
 # cuda 9.1 and friends
 build/cuda91/gcc/all/debug/static:
@@ -143,7 +148,8 @@ build/cuda91/gcc/all/debug/static:
     BUILD_OMP: "ON"
     BUILD_CUDA: "ON"
     BUILD_TYPE: Debug
-    EXTRA_CMAKE_FLAGS: *cuda_flags_static
+    BUILD_SHARED_LIBS: "OFF"
+    EXTRA_CMAKE_FLAGS: *cuda_flags
 
 build/cuda91/clang/all/release/shared:
   <<: *default_build
@@ -155,7 +161,7 @@ build/cuda91/clang/all/release/shared:
     BUILD_OMP: "ON"
     BUILD_CUDA: "ON"
     BUILD_TYPE: Release
-    EXTRA_CMAKE_FLAGS: *cuda_flags_shared
+    EXTRA_CMAKE_FLAGS: *cuda_flags
 
 build/cuda91/intel/all/debug/shared:
   <<: *default_build
@@ -167,7 +173,7 @@ build/cuda91/intel/all/debug/shared:
     BUILD_OMP: "ON"
     BUILD_CUDA: "ON"
     BUILD_TYPE: Debug
-    EXTRA_CMAKE_FLAGS: *cuda_flags_shared
+    EXTRA_CMAKE_FLAGS: *cuda_flags
 
 # cuda 9.2 and friends
 build/cuda92/gcc/all/release/shared:
@@ -178,7 +184,7 @@ build/cuda92/gcc/all/release/shared:
     BUILD_OMP: "ON"
     BUILD_CUDA: "ON"
     BUILD_TYPE: Release
-    EXTRA_CMAKE_FLAGS: *cuda_flags_shared
+    EXTRA_CMAKE_FLAGS: *cuda_flags
 
 build/cuda92/clang/all/debug/static:
   <<: *default_build
@@ -190,7 +196,8 @@ build/cuda92/clang/all/debug/static:
     BUILD_OMP: "ON"
     BUILD_CUDA: "ON"
     BUILD_TYPE: Debug
-    EXTRA_CMAKE_FLAGS: *cuda_flags_static
+    BUILD_SHARED_LIBS: "OFF"
+    EXTRA_CMAKE_FLAGS: *cuda_flags
 
 build/cuda92/intel/all/release/static:
   <<: *default_build
@@ -202,7 +209,8 @@ build/cuda92/intel/all/release/static:
     BUILD_OMP: "ON"
     BUILD_CUDA: "ON"
     BUILD_TYPE: Release
-    EXTRA_CMAKE_FLAGS: *cuda_flags_static
+    BUILD_SHARED_LIBS: "OFF"
+    EXTRA_CMAKE_FLAGS: *cuda_flags
 
 # cuda 10.0 and friends
 build/cuda100/gcc/all/debug/shared:
@@ -213,7 +221,7 @@ build/cuda100/gcc/all/debug/shared:
     BUILD_OMP: "ON"
     BUILD_CUDA: "ON"
     BUILD_TYPE: Debug
-    EXTRA_CMAKE_FLAGS: *cuda_flags_shared
+    EXTRA_CMAKE_FLAGS: *cuda_flags
 
 build/cuda100/clang/all/release/static:
   <<: *default_build
@@ -225,7 +233,8 @@ build/cuda100/clang/all/release/static:
     BUILD_OMP: "ON"
     BUILD_CUDA: "ON"
     BUILD_TYPE: Release
-    EXTRA_CMAKE_FLAGS: *cuda_flags_static
+    BUILD_SHARED_LIBS: "OFF"
+    EXTRA_CMAKE_FLAGS: *cuda_flags
 
 build/cuda100/intel/all/release/shared:
   <<: *default_build
@@ -237,7 +246,7 @@ build/cuda100/intel/all/release/shared:
     BUILD_OMP: "ON"
     BUILD_CUDA: "ON"
     BUILD_TYPE: Release
-    EXTRA_CMAKE_FLAGS: *cuda_flags_shared
+    EXTRA_CMAKE_FLAGS: *cuda_flags
 
 # no cuda but latest gcc and "soon" clang 7
 build/nocuda/gcc/core/debug/static:
@@ -247,8 +256,7 @@ build/nocuda/gcc/core/debug/static:
     <<: *default_variables
     BUILD_REFERENCE: "OFF"
     BUILD_TYPE: Debug
-    EXTRA_CMAKE_FLAGS: &flags_static
-      -DBUILD_SHARED_LIBS=OFF
+    BUILD_SHARED_LIBS: "OFF"
 
 build/nocuda/clang/core/release/shared:
   <<: *default_build
@@ -259,8 +267,6 @@ build/nocuda/clang/core/release/shared:
     CXX_COMPILER: clang++
     BUILD_REFERENCE: "OFF"
     BUILD_TYPE: Release
-    EXTRA_CMAKE_FLAGS: &flags_shared
-      -DBUILD_SHARED_LIBS=ON
 
 build/nocuda/intel/core/debug/shared:
   <<: *default_build
@@ -271,7 +277,6 @@ build/nocuda/intel/core/debug/shared:
     CXX_COMPILER: icpc
     BUILD_REFERENCE: "OFF"
     BUILD_TYPE: Debug
-    EXTRA_CMAKE_FLAGS: *flags_shared
 
 build/nocuda/gcc/omp/release/shared:
   <<: *default_build
@@ -280,7 +285,6 @@ build/nocuda/gcc/omp/release/shared:
     <<: *default_variables
     BUILD_OMP: "ON"
     BUILD_TYPE: Release
-    EXTRA_CMAKE_FLAGS: *flags_shared
 
 build/nocuda/clang/omp/debug/static:
   <<: *default_build
@@ -291,7 +295,7 @@ build/nocuda/clang/omp/debug/static:
     CXX_COMPILER: clang++
     BUILD_OMP: "ON"
     BUILD_TYPE: Debug
-    EXTRA_CMAKE_FLAGS: *flags_static
+    BUILD_SHARED_LIBS: "OFF"
 
 build/nocuda/intel/omp/release/static:
   <<: *default_build
@@ -302,7 +306,7 @@ build/nocuda/intel/omp/release/static:
     CXX_COMPILER: icpc
     BUILD_OMP: "ON"
     BUILD_TYPE: Release
-    EXTRA_CMAKE_FLAGS: *flags_static
+    BUILD_SHARED_LIBS: "OFF"
 
 # Test jobs
 test/cuda90/gcc/all/debug/shared:
@@ -540,8 +544,9 @@ gh-pages:
         -DCMAKE_C_COMPILER=${C_COMPILER} -DCMAKE_CXX_COMPILER=${CXX_COMPILER}
         -DCMAKE_BUILD_TYPE=${BUILD_TYPE} -DBUILD_SHARED_LIBS=ON
         ${EXTRA_CMAKE_FLAGS} -DGINKGO_DEVEL_TOOLS=OFF -DGINKGO_BUILD_REFERENCE=OFF
-        -DGINKGO_BUILD_OMP=OFF -DGINKGO_BUILD_CUDA=OFF -DGINKGO_BUILD_TESTS=OFF
-        -DGINKGO_BUILD_EXAMPLES=OFF -DGINKGO_BUILD_DOC=ON -DGINKGO_DOC_GENERATE_PDF=ON
+        -DGINKGO_BUILD_OMP=OFF -DGINKGO_BUILD_CUDA=OFF -DGINKGO_BUILD_HIP=OFF
+        -DGINKGO_BUILD_TESTS=OFF -DGINKGO_BUILD_EXAMPLES=OFF
+        -DGINKGO_BUILD_DOC=ON -DGINKGO_DOC_GENERATE_PDF=ON
     - make usr
     - make pdf
     - popd
@@ -666,6 +671,7 @@ fineci-benchmark-build:
                   -DGINKGO_BUILD_REFERENCE=${BUILD_REFERENCE} \\
                   -DGINKGO_BUILD_OMP=${BUILD_OMP} \\
                   -DGINKGO_BUILD_CUDA=${BUILD_CUDA} \\
+                  -DGINKGO_BUILD_HIP=${BUILD_HIP} \\
                   -DGINKGO_BUILD_TESTS=OFF -DGINKGO_BUILD_EXAMPLES=OFF \\
                   -DGINKGO_BUILD_BENCHMARKS=ON
         make -j$(grep 'core id' /proc/cpuinfo | sort -u | wc -l)
